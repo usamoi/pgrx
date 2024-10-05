@@ -16,12 +16,15 @@ std::compile_error!("exactly one feature must be provided (pg12, pg13, pg14, pg1
 mod cshim;
 mod cstr;
 mod include;
+mod native;
 mod node;
 mod port;
 pub mod submodules;
 
 #[cfg(feature = "cshim")]
 pub use cshim::*;
+
+pub use native::*;
 
 pub use cstr::AsPgCStr;
 pub use include::*;

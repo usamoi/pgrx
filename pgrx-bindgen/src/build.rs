@@ -21,13 +21,11 @@ use std::fs;
 use std::path::{self, Path, PathBuf}; // disambiguate path::Path and syn::Type::Path
 use std::process::{Command, Output};
 use std::rc::Rc;
-use std::sync::OnceLock;
-use syn::{ForeignItem, Item, ItemConst};
+use syn::{Item, ItemConst};
 
 const BLOCKLISTED_TYPES: [&str; 3] = ["Datum", "NullableDatum", "Oid"];
 
 pub(super) mod clang;
-pub(super) mod sym_blocklist;
 
 #[derive(Debug)]
 struct BindingOverride {
@@ -766,6 +764,7 @@ fn run_bindgen(
     let (autodetect, includes) = clang::detect_include_paths_for(preferred_clang);
     let mut binder = bindgen::Builder::default();
     binder = add_blocklists(binder);
+    binder = binder.allowlist_file(format!("{}.*", pg_target_include(major_version, pg_config)?));
     binder = add_derives(binder);
     if !autodetect {
         let builtin_includes = includes.iter().filter_map(|p| Some(format!("-I{}", p.to_str()?)));
@@ -777,7 +776,7 @@ fn run_bindgen(
     let bindings = binder
         .header(include_h.display().to_string())
         .clang_args(extra_bindgen_clang_args(pg_config)?)
-        .clang_args(pg_target_include_flags(major_version, pg_config)?)
+        .clang_arg(format!("-I{}", pg_target_include(major_version, pg_config)?))
         .detect_include_paths(autodetect)
         .parse_callbacks(Box::new(overrides))
         .default_enum_style(bindgen::EnumVariation::ModuleConsts)
@@ -828,31 +827,13 @@ pub const {module}_{variant}: {ty} = {value};"#,
 fn add_blocklists(bind: bindgen::Builder) -> bindgen::Builder {
     bind.blocklist_type("Datum") // manually wrapping datum for correctness
         .blocklist_type("Oid") // "Oid" is not just any u32
-        .blocklist_function("varsize_any") // pgrx converts the VARSIZE_ANY macro, so we don't want to also have this function, which is in heaptuple.c
-        .blocklist_function("(?:raw_)?(?:expression|query|query_or_expression)_tree_walker")
-        .blocklist_function("planstate_tree_walker")
-        .blocklist_function("range_table_(?:entry_)?walker")
-        .blocklist_function(".*(?:set|long)jmp")
-        .blocklist_function("pg_re_throw")
-        .blocklist_function("err(start|code|msg|detail|context_msg|hint|finish)")
         .blocklist_var("CONFIGURE_ARGS") // configuration during build is hopefully irrelevant
         .blocklist_var("_*(?:HAVE|have)_.*") // header tracking metadata
         .blocklist_var("_[A-Z_]+_H") // more header metadata
-        .blocklist_item("__[A-Z].*") // these are reserved and unused by Postgres
-        .blocklist_item("__darwin.*") // this should always be Apple's names
-        .blocklist_function("pq(?:Strerror|Get.*)") // wrappers around platform functions: user can call those themselves
-        .blocklist_function("log")
-        .blocklist_item(".*pthread.*)") // shims for pthreads on non-pthread systems, just use std::thread
-        .blocklist_item(".*(?i:va)_(?i:list|start|end|copy).*") // do not need va_list anything!
-        .blocklist_function("(?:pg_|p)v(?:sn?|f)?printf")
-        .blocklist_function("appendStringInfoVA")
-        .blocklist_file("stdarg.h")
-        // these cause cause warnings, errors, or deprecations on some systems,
-        // and are not useful for us.
-        .blocklist_function("(?:sigstack|sigreturn|siggetmask|gets|vfork|te?mpnam(?:_r)?|mktemp)")
-        // Missing on some systems, despite being in their headers.
-        .blocklist_function("inet_net_pton.*")
-        // To make it work without `cshim`
+        // It's used by explict `extern "C"`
+        .blocklist_function("pg_re_throw")
+        .blocklist_function("err(start|code|msg|detail|context_msg|hint|finish)")
+        // These functions are already ported in Rust
         .blocklist_function("heap_getattr")
         .blocklist_function("BufferGetBlock")
         .blocklist_function("BufferGetPage")
@@ -877,6 +858,9 @@ fn add_blocklists(bind: bindgen::Builder) -> bindgen::Builder {
         .blocklist_function("range_table_walker")
         .blocklist_function("raw_expression_tree_walker")
         .blocklist_function("type_is_array")
+        .blocklist_function("varsize_any")
+        // it's defined twice on Windows, so use PGERROR instead
+        .blocklist_item("ERROR")
 }
 
 fn add_derives(bind: bindgen::Builder) -> bindgen::Builder {
@@ -926,19 +910,15 @@ fn target_env_tracked(s: &str) -> Option<String> {
     env_tracked(&format!("{s}_{target}")).or_else(|| env_tracked(s))
 }
 
-/// Returns `Err` if `pg_config` errored, `None` if we should
-fn pg_target_include_flags(pg_version: u16, pg_config: &PgConfig) -> eyre::Result<Option<String>> {
+fn pg_target_include(pg_version: u16, pg_config: &PgConfig) -> eyre::Result<String> {
     let var = "PGRX_INCLUDEDIR_SERVER";
     let value =
         target_env_tracked(&format!("{var}_PG{pg_version}")).or_else(|| target_env_tracked(var));
     match value {
         // No configured value: ask `pg_config`.
-        None => Ok(Some(format!("-I{}", pg_config.includedir_server()?.display()))),
-        // Configured to empty string: assume bindgen is getting it some other
-        // way, pass nothing.
-        Some(overridden) if overridden.is_empty() => Ok(None),
+        None => Ok(pg_config.includedir_server()?.display().to_string()),
         // Configured to non-empty string: pass to bindgen
-        Some(overridden) => Ok(Some(format!("-I{overridden}"))),
+        Some(overridden) => Ok(overridden),
     }
 }
 
@@ -952,9 +932,7 @@ fn build_shim(
     std::fs::copy(shim_src, shim_dst).unwrap();
 
     let mut build = cc::Build::new();
-    if let Some(flag) = pg_target_include_flags(major_version, pg_config)? {
-        build.flag(&flag);
-    }
+    build.flag(&format!("-I{}", pg_target_include(major_version, pg_config)?));
     for flag in extra_bindgen_clang_args(pg_config)? {
         build.flag(&flag);
     }
@@ -1094,40 +1072,15 @@ fn run_command(mut command: &mut Command, version: &str) -> eyre::Result<Output>
     Ok(rc)
 }
 
-// Plausibly it would be better to generate a regex to pass to bindgen for this,
-// but this is less error-prone for now.
-static BLOCKLISTED: OnceLock<BTreeSet<&'static str>> = OnceLock::new();
-fn is_blocklisted_item(item: &ForeignItem) -> bool {
-    let sym_name = match item {
-        ForeignItem::Fn(f) => &f.sig.ident,
-        // We don't *need* to filter statics too (only functions), but it
-        // doesn't hurt.
-        ForeignItem::Static(s) => &s.ident,
-        _ => return false,
-    };
-    BLOCKLISTED
-        .get_or_init(|| sym_blocklist::SYMBOLS.iter().copied().collect::<BTreeSet<&str>>())
-        .contains(sym_name.to_string().as_str())
-}
-
 fn apply_pg_guard(items: &Vec<syn::Item>) -> eyre::Result<proc_macro2::TokenStream> {
     let mut out = proc_macro2::TokenStream::new();
     for item in items {
         match item {
             Item::ForeignMod(block) => {
-                let abi = &block.abi;
-                let (mut extern_funcs, mut others) = (Vec::new(), Vec::new());
-                block.items.iter().filter(|&item| !is_blocklisted_item(item)).cloned().for_each(
-                    |item| match item {
-                        ForeignItem::Fn(func) => extern_funcs.push(func),
-                        item => others.push(item),
-                    },
-                );
                 out.extend(quote! {
                     #[pgrx_macros::pg_guard]
-                    #abi { #(#extern_funcs)* }
+                    #block
                 });
-                out.extend(quote! { #abi { #(#others)* } });
             }
             _ => {
                 out.extend(item.into_token_stream());
