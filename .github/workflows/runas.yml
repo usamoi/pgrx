@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  TOOL_DIR: ./tools
 
 jobs:
   ubuntu:
@@ -19,6 +20,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-cargo-pgrx-test--runas"
+
+      - name: Install Rust
+        run: |
+          "$TOOL_DIR"/rustup.sh
 
       - name: Install Postgres deps
         run: |
@@ -35,4 +40,6 @@ jobs:
         run: cargo pgrx init --pg14=$(which pg_config)
 
       - name: Test cargo pgrx test --runas
-        run: cd pgrx-examples/arrays && cargo pgrx test pg14 --runas postgres --pgdata=/tmp/pgdata
+        run: |
+          echo 0 | sudo tee /proc/sys/fs/protected_fifos
+          cd pgrx-examples/arrays && cargo pgrx test pg14 --runas postgres --pgdata=/tmp/pgdata
