@@ -52,25 +52,33 @@ mod tests {
 
     #[pg_test]
     fn test_leak_and_drop_with_panic() {
-        let result = std::panic::catch_unwind(|| unsafe {
-            struct Thing;
-            impl Drop for Thing {
-                fn drop(&mut self) {
-                    panic!("please don't crash")
-                }
-            }
+        fn flatten<T, E>(result: Result<Result<T, E>, E>) -> Result<T, E> {
+            result?
+        }
 
-            PgMemoryContexts::Transient {
-                parent: PgMemoryContexts::CurrentMemoryContext.value(),
-                name: "test",
-                min_context_size: 4096,
-                initial_block_size: 4096,
-                max_block_size: 4096,
-            }
-            .switch_to(|context| {
-                context.leak_and_drop_on_delete(Thing);
-            });
-        });
+        let result = flatten(std::panic::catch_unwind(|| unsafe {
+            pgrx::pg_sys::ffi::pg_guard_ffi_boundary(|| {
+                std::panic::catch_unwind(|| {
+                    struct Thing;
+                    impl Drop for Thing {
+                        fn drop(&mut self) {
+                            panic!("please don't crash")
+                        }
+                    }
+
+                    PgMemoryContexts::Transient {
+                        parent: PgMemoryContexts::CurrentMemoryContext.value(),
+                        name: "test",
+                        min_context_size: 4096,
+                        initial_block_size: 4096,
+                        max_block_size: 4096,
+                    }
+                    .switch_to(|context| {
+                        context.leak_and_drop_on_delete(Thing);
+                    });
+                })
+            })
+        }));
 
         assert!(result.is_err());
         let err = result.unwrap_err();

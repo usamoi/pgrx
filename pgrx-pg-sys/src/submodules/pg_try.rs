@@ -137,7 +137,9 @@ impl<'a, R, F: FnOnce() -> R + UnwindSafe> PgTryBuilder<'a, R, F> {
     /// Run the main execution block closure.  Any error raised will be passed to a registered
     /// catch handler, and when finished, the finally block will be run.
     pub fn execute(mut self) -> R {
-        let result = catch_unwind(self.func);
+        let result = catch_unwind(move || unsafe {
+            crate::ffi::pg_guard_ffi_boundary(|| catch_unwind(self.func))
+        });
 
         fn finally<F: FnMut()>(f: &mut Option<F>) {
             if let Some(f) = f {
@@ -146,8 +148,8 @@ impl<'a, R, F: FnOnce() -> R + UnwindSafe> PgTryBuilder<'a, R, F> {
         }
 
         let result = match result {
-            Ok(result) => result,
-            Err(error) => {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) | Err(error) => {
                 let (sqlerrcode, root_cause) = match downcast_panic_payload(error) {
                     CaughtError::RustPanic { ereport, payload } => {
                         let sqlerrcode = ereport.inner.sqlerrcode;

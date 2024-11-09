@@ -156,10 +156,18 @@ fn foreign_item_fn(func: &ForeignItemFn, abi: &syn::Abi) -> syn::Result<proc_mac
         #[inline]
         #[track_caller]
         pub unsafe fn #func_name ( #arg_list_with_types ) #return_type {
-            crate::ffi::pg_guard_ffi_boundary(move || {
+            #[cfg(not(target_os = "windows"))]
+            {
+                crate::ffi::pg_guard_ffi_boundary(move || {
+                    #link #abi { #func }
+                    #func_name(#arg_list)
+                })
+            }
+            #[cfg(target_os = "windows")]
+            {
                 #link #abi { #func }
                 #func_name(#arg_list)
-            })
+            }
         }
     })
 }
