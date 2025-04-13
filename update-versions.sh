@@ -66,6 +66,12 @@ cargo run --manifest-path=./tools/version-updater/Cargo.toml \
 
 
 echo "Generating bindings -- this may take a few moments"
-PGRX_PG_SYS_GENERATE_BINDINGS_FOR_RELEASE=1 cargo test --no-run $CARGO_QUIET_FLAG --workspace --no-default-features --features "pg${PG_VER:-14}"
+cargo build --bin pgrx-bindgen
+./target/debug/pgrx-bindgen -- --pg_config $HOME/.pgrx/13.20/pgrx-install/bin/pg_config --output ./pgrx-pg-sys/assets/pg13.zip &
+./target/debug/pgrx-bindgen -- --pg_config $HOME/.pgrx/14.17/pgrx-install/bin/pg_config --output ./pgrx-pg-sys/assets/pg14.zip &
+./target/debug/pgrx-bindgen -- --pg_config $HOME/.pgrx/15.12/pgrx-install/bin/pg_config --output ./pgrx-pg-sys/assets/pg15.zip &
+./target/debug/pgrx-bindgen -- --pg_config $HOME/.pgrx/16.8/pgrx-install/bin/pg_config --output ./pgrx-pg-sys/assets/pg16.zip &
+./target/debug/pgrx-bindgen -- --pg_config $HOME/.pgrx/17.4/pgrx-install/bin/pg_config --output ./pgrx-pg-sys/assets/pg17.zip &
+wait
 
 echo "Done!"

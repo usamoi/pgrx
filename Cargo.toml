@@ -59,7 +59,7 @@ pgrx-macros = { path = "./pgrx-macros", version = "=0.14.1" }
 pgrx-pg-sys = { path = "./pgrx-pg-sys", version = "=0.14.1" }
 pgrx-sql-entity-graph = { path = "./pgrx-sql-entity-graph", version = "=0.14.1" }
 pgrx-pg-config = { path = "./pgrx-pg-config", version = "=0.14.1" }
-pgrx-bindgen = { path = "./pgrx-bindgen", version = "=0.14.1" }
+pgrx-bindgen = { path = "./pgrx-bindgen", version = "=0.14.1", default-features = false }
 
 cargo_metadata = "0.18.0"
 cargo-edit = "=0.13.2" # format-preserving edits to cargo.toml

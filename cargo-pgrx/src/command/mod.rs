@@ -11,7 +11,6 @@ use env_proxy::for_url_str;
 use ureq::{Agent, Proxy};
 
 pub(crate) mod connect;
-pub(crate) mod cross;
 pub(crate) mod get;
 pub(crate) mod info;
 pub(crate) mod init;

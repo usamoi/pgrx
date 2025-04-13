@@ -16,11 +16,27 @@ use std::env::consts::EXE_SUFFIX;
 use std::ffi::OsString;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 use thiserror::Error;
 use url::Url;
+
+pub fn main() -> eyre::Result<()> {
+    println!("cargo:rustc-check-cfg=cfg(pgrx)");
+    println!("cargo:rustc-cfg=pgrx");
+
+    let pg_config = PgConfig::from_pg_config_path(std::env::var("DEP_PGRX_PG_CONFIG")?);
+
+    if std::env::var("CARGO_CFG_TARGET_OS")? == "macos" {
+        let postmaster_path = pg_config.postmaster_path()?;
+        println!(
+            "cargo:rustc-link-arg-cdylib=-Wl,-bundle,-bundle_loader,{}",
+            postmaster_path.display()
+        );
+    }
+    Ok(())
+}
 
 pub mod cargo;
 
@@ -172,6 +188,10 @@ impl PgConfig {
         let path =
             pathsearch::find_executable_in_path("pg_config").unwrap_or_else(|| "pg_config".into());
         Self::new_with_defaults(path)
+    }
+
+    pub fn from_pg_config_path(path: impl AsRef<Path>) -> Self {
+        Self::new_with_defaults(path.as_ref().to_path_buf())
     }
 
     /// Construct a new [`PgConfig`] from the set of environment variables that are prefixed with

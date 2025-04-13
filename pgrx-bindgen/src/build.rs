@@ -9,18 +9,14 @@
 //LICENSE Use of this source code is governed by the MIT license that can be found in the LICENSE file.
 use bindgen::callbacks::{DeriveTrait, EnumVariantValue, ImplementsTrait, MacroParsingBehavior};
 use bindgen::NonCopyUnionStyle;
-use eyre::{eyre, WrapErr};
-use pgrx_pg_config::{
-    is_supported_major_version, PgConfig, PgConfigSelector, PgMinorVersion, PgVersion, Pgrx,
-    SUPPORTED_VERSIONS,
-};
+use eyre::WrapErr;
+use pgrx_pg_config::{PgConfig, PgMinorVersion, PgVersion};
 use quote::{quote, ToTokens};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
-use std::path::{self, Path, PathBuf}; // disambiguate path::Path and syn::Type::Path
-use std::process::{Command, Output};
+use std::io::Read;
+use std::path::{Path, PathBuf}; // disambiguate path::Path and syn::Type::Path
 use std::rc::Rc;
 use syn::{Item, ItemConst};
 
@@ -148,298 +144,13 @@ impl bindgen::callbacks::ParseCallbacks for BindingOverride {
     }
 }
 
-pub fn main() -> eyre::Result<()> {
-    if env_tracked("DOCS_RS").as_deref() == Some("1") {
-        return Ok(());
-    }
-
-    // dump the environment for debugging if asked
-    if env_tracked("PGRX_BUILD_VERBOSE").as_deref() == Some("true") {
-        for (k, v) in std::env::vars() {
-            eprintln!("{k}={v}");
-        }
-    }
-
-    let compile_cshim = env_tracked("CARGO_FEATURE_CSHIM").as_deref() == Some("1");
-
-    let is_for_release =
-        env_tracked("PGRX_PG_SYS_GENERATE_BINDINGS_FOR_RELEASE").as_deref() == Some("1");
-
-    let build_paths = BuildPaths::from_env();
-
-    eprintln!("build_paths={build_paths:?}");
-
-    emit_rerun_if_changed();
-
-    let pg_configs: Vec<(u16, PgConfig)> = if is_for_release {
-        // This does not cross-check config.toml and Cargo.toml versions, as it is release infra.
-        Pgrx::from_config()?.iter(PgConfigSelector::All)
-            .map(|r| r.expect("invalid pg_config"))
-            .map(|c| (c.major_version().expect("invalid major version"), c))
-            .filter_map(|t| {
-                if is_supported_major_version(t.0) {
-                    Some(t)
-                } else {
-                    println!(
-                        "cargo:warning={} contains a configuration for pg{}, which pgrx does not support.",
-                        Pgrx::config_toml()
-                            .expect("Could not get PGRX configuration TOML")
-                            .to_string_lossy(),
-                        t.0
-                    );
-                    None
-                }
-            })
-            .collect()
-    } else {
-        let mut found = Vec::new();
-        for pgver in SUPPORTED_VERSIONS() {
-            if env_tracked(&format!("CARGO_FEATURE_PG{}", pgver.major)).is_some() {
-                found.push(pgver);
-            }
-        }
-        let found_ver = match &found[..] {
-            [ver] => ver,
-            [] => {
-                return Err(eyre!(
-                    "Did not find `pg$VERSION` feature. `pgrx-pg-sys` requires one of {} to be set",
-                    SUPPORTED_VERSIONS()
-                        .iter()
-                        .map(|pgver| format!("`pg{}`", pgver.major))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-            }
-            versions => {
-                return Err(eyre!(
-                    "Multiple `pg$VERSION` features found.\n`--no-default-features` may be required.\nFound: {}",
-                    versions
-                        .iter()
-                        .map(|version| format!("pg{}", version.major))
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                ))
-            }
-        };
-
-        let found_major = found_ver.major;
-        if let Ok(pg_config) = PgConfig::from_env() {
-            let major_version = pg_config.major_version()?;
-
-            if major_version != found_major {
-                panic!("Feature flag `pg{found_major}` does not match version from the environment-described PgConfig (`{major_version}`)")
-            }
-            vec![(major_version, pg_config)]
-        } else {
-            let specific = Pgrx::from_config()?.get(&format!("pg{}", found_ver.major))?;
-            vec![(found_ver.major, specific)]
-        }
-    };
-
-    // make sure we're not trying to build any of the yanked postgres versions
-    for (_, pg_config) in &pg_configs {
-        let version = pg_config.get_version()?;
-        if YANKED_POSTGRES_VERSIONS.contains(&version) {
-            panic!("Postgres v{}{} is incompatible with \
-                    other versions in this major series and is not supported by pgrx.  Please upgrade \
-                    to the latest version in the v{} series.", version.major, version.minor, version.major);
-        }
-    }
-
-    std::thread::scope(|scope| {
-        // This is pretty much either always 1 (normally) or 5 (for releases),
-        // but in the future if we ever have way more, we should consider
-        // chunking `pg_configs` based on `thread::available_parallelism()`.
-        let threads = pg_configs
-            .iter()
-            .map(|(pg_major_ver, pg_config)| {
-                scope.spawn(|| {
-                    generate_bindings(
-                        *pg_major_ver,
-                        pg_config,
-                        &build_paths,
-                        is_for_release,
-                        compile_cshim,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        // Most of the rest of this is just for better error handling --
-        // `thread::scope` already joins the threads for us before it returns.
-        let results = threads
-            .into_iter()
-            .map(|thread| thread.join().expect("thread panicked while generating bindings"))
-            .collect::<Vec<eyre::Result<_>>>();
-        results.into_iter().try_for_each(|r| r)
-    })?;
-
-    if compile_cshim {
-        // compile the cshim for each binding
-        for (_version, pg_config) in pg_configs {
-            build_shim(&build_paths.shim_src, &build_paths.shim_dst, &pg_config)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn emit_rerun_if_changed() {
-    // `pgrx-pg-config` doesn't emit one for this.
-    println!("cargo:rerun-if-env-changed=PGRX_PG_CONFIG_PATH");
-    println!("cargo:rerun-if-env-changed=PGRX_PG_CONFIG_AS_ENV");
-    // Bindgen's behavior depends on these vars, but it doesn't emit them
-    // directly because the output would cause issue with `bindgen-cli`. Do it
-    // on bindgen's behalf.
-    println!("cargo:rerun-if-env-changed=LLVM_CONFIG_PATH");
-    println!("cargo:rerun-if-env-changed=LIBCLANG_PATH");
-    println!("cargo:rerun-if-env-changed=LIBCLANG_STATIC_PATH");
-    // Follows the logic bindgen uses here, more or less.
-    // https://github.com/rust-lang/rust-bindgen/blob/e6dd2c636/bindgen/lib.rs#L2918
-    println!("cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS");
-    if let Some(target) = env_tracked("TARGET") {
-        println!("cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS_{target}");
-        println!(
-            "cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS_{}",
-            target.replace('-', "_"),
-        );
-    }
-
-    // don't want to get stuck always generating bindings
-    println!("cargo:rerun-if-env-changed=PGRX_PG_SYS_GENERATE_BINDINGS_FOR_RELEASE");
-
-    println!("cargo:rerun-if-changed=include");
-    println!("cargo:rerun-if-changed=pgrx-cshim.c");
-
-    if let Ok(pgrx_config) = Pgrx::config_toml() {
-        println!("cargo:rerun-if-changed={}", pgrx_config.display());
-    }
-}
-
-fn generate_bindings(
-    major_version: u16,
-    pg_config: &PgConfig,
-    build_paths: &BuildPaths,
-    is_for_release: bool,
-    enable_cshim: bool,
-) -> eyre::Result<()> {
-    let mut include_h = build_paths.manifest_dir.clone();
-    include_h.push("include");
-    include_h.push(format!("pg{major_version}.h"));
-
-    let bindgen_output = get_bindings(major_version, pg_config, &include_h, enable_cshim)
-        .wrap_err_with(|| format!("bindgen failed for pg{major_version}"))?;
-
-    let oids = extract_oids(&bindgen_output);
-    let rewritten_items = rewrite_items(bindgen_output, &oids)
-        .wrap_err_with(|| format!("failed to rewrite items for pg{major_version}"))?;
-    let oids = format_builtin_oid_impl(oids);
-
-    let dest_dirs = if is_for_release {
-        vec![build_paths.out_dir.clone(), build_paths.src_dir.clone()]
-    } else {
-        vec![build_paths.out_dir.clone()]
-    };
-    for dest_dir in dest_dirs {
-        let mut bindings_file = dest_dir.clone();
-        bindings_file.push(format!("pg{major_version}.rs"));
-        write_rs_file(
-            rewritten_items.clone(),
-            &bindings_file,
-            quote! {
-                use crate as pg_sys;
-                use crate::{Datum, MultiXactId, Oid, PgNode, TransactionId};
-            },
-            is_for_release,
-        )
-        .wrap_err_with(|| {
-            format!(
-                "Unable to write bindings file for pg{} to `{}`",
-                major_version,
-                bindings_file.display()
-            )
-        })?;
-
-        let mut oids_file = dest_dir.clone();
-        oids_file.push(format!("pg{major_version}_oids.rs"));
-        write_rs_file(oids.clone(), &oids_file, quote! {}, is_for_release).wrap_err_with(|| {
-            format!(
-                "Unable to write oids file for pg{} to `{}`",
-                major_version,
-                oids_file.display()
-            )
-        })?;
-    }
-
-    let lib_dir = pg_config.lib_dir()?;
-    println!(
-        "cargo:rustc-link-search={}",
-        lib_dir.to_str().ok_or(eyre!("{lib_dir:?} is not valid UTF-8 string"))?
-    );
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct BuildPaths {
-    /// CARGO_MANIFEST_DIR
-    manifest_dir: PathBuf,
-    /// OUT_DIR
-    out_dir: PathBuf,
-    /// {manifest_dir}/src
-    src_dir: PathBuf,
-    /// {manifest_dir}/pgrx-cshim.c
-    shim_src: PathBuf,
-    /// {out_dir}/pgrx-cshim.c
-    shim_dst: PathBuf,
-}
-
-impl BuildPaths {
-    fn from_env() -> Self {
-        // Cargo guarantees these are provided, so unwrap is fine.
-        let manifest_dir = env_tracked("CARGO_MANIFEST_DIR").map(PathBuf::from).unwrap();
-        let out_dir = env_tracked("OUT_DIR").map(PathBuf::from).unwrap();
-        Self {
-            src_dir: manifest_dir.join("src/include"),
-            shim_src: manifest_dir.join("pgrx-cshim.c"),
-            shim_dst: out_dir.join("pgrx-cshim.c"),
-            out_dir,
-            manifest_dir,
-        }
-    }
-}
-
-fn write_rs_file(
-    code: proc_macro2::TokenStream,
-    file_path: &Path,
-    header: proc_macro2::TokenStream,
-    is_for_release: bool,
-) -> eyre::Result<()> {
-    use std::io::Write;
-    let mut contents = header;
-    contents.extend(code);
-    let mut file = fs::File::create(file_path)?;
-    write!(file, "/* Automatically generated by bindgen. Do not hand-edit.")?;
-    if is_for_release {
-        write!(
-            file,
-            "\n
-        This code is generated for documentation purposes, so that it is
-        easy to reference on docs.rs. Bindings are regenerated for your
-        build of pgrx, and the values of your Postgres version may differ.
-        */"
-        )
-    } else {
-        write!(file, " */")
-    }?;
-    write!(file, "{contents}")?;
-    rust_fmt(file_path)
-}
-
 /// Given a token stream representing a file, apply a series of transformations to munge
 /// the bindgen generated code with some postgres specific enhancements
 fn rewrite_items(
     mut file: syn::File,
     oids: &BTreeMap<syn::Ident, Box<syn::Expr>>,
 ) -> eyre::Result<proc_macro2::TokenStream> {
+    fix_linkage(&mut file);
     rewrite_c_abi_to_c_unwind(&mut file);
     let items_vec = rewrite_oid_consts(&file.items, oids);
     let mut items = apply_pg_guard(&items_vec)?;
@@ -760,43 +471,43 @@ impl Ord for StructDescriptor<'_> {
     }
 }
 
-fn get_bindings(
-    major_version: u16,
-    pg_config: &PgConfig,
-    include_h: &path::Path,
-    enable_cshim: bool,
-) -> eyre::Result<syn::File> {
-    let bindings = if let Some(info_dir) =
-        target_env_tracked(&format!("PGRX_TARGET_INFO_PATH_PG{major_version}"))
-    {
-        let bindings_file = format!("{info_dir}/pg{major_version}_raw_bindings.rs");
-        std::fs::read_to_string(&bindings_file)
-            .wrap_err_with(|| format!("failed to read raw bindings from {bindings_file}"))?
-    } else {
-        let bindings = run_bindgen(major_version, pg_config, include_h, enable_cshim)?;
-        if let Some(path) = env_tracked("PGRX_PG_SYS_EXTRA_OUTPUT_PATH") {
-            std::fs::write(path, &bindings)?;
-        }
-        bindings
-    };
-    syn::parse_file(bindings.as_str()).wrap_err_with(|| "failed to parse generated bindings")
-}
-
 /// Given a specific postgres version, `run_bindgen` generates bindings for the given
-/// postgres version and returns them as a token stream.
-fn run_bindgen(
-    major_version: u16,
+/// postgres version and returns them.
+pub fn generate_bindings(
+    target_os: &str,
+    target_env: &str,
     pg_config: &PgConfig,
-    include_h: &path::Path,
-    enable_cshim: bool,
-) -> eyre::Result<String> {
+    bindgen_no_detect_includes: bool,
+) -> eyre::Result<(String, String, String)> {
+    let version = pg_config.get_version()?;
+    if YANKED_POSTGRES_VERSIONS.contains(&version) {
+        panic!(
+            "Postgres v{}{} is incompatible with \
+                other versions in this major series and is not supported by pgrx.  Please upgrade \
+                to the latest version in the v{} series.",
+            version.major, version.minor, version.major
+        );
+    }
+    let major_version = pg_config.major_version()?;
     eprintln!("Generating bindings for pg{major_version}");
+    let contents = match major_version {
+        13 => include_str!("../assets/pg13.h"),
+        14 => include_str!("../assets/pg14.h"),
+        15 => include_str!("../assets/pg15.h"),
+        16 => include_str!("../assets/pg16.h"),
+        17 => include_str!("../assets/pg17.h"),
+        _ => eyre::bail!("unsupported postgres version"),
+    };
     let configure = pg_config.configure()?;
     let preferred_clang: Option<&std::path::Path> = configure.get("CLANG").map(|s| s.as_ref());
     eprintln!("pg_config --configure CLANG = {preferred_clang:?}");
-    let pg_target_includes = pg_target_includes(major_version, pg_config)?;
+    let pg_target_includes = pg_target_includes(target_env, pg_config)?;
     eprintln!("pg_target_includes = {pg_target_includes:?}");
-    let (autodetect, includes) = clang::detect_include_paths_for(preferred_clang);
+    let (autodetect, includes) = if !bindgen_no_detect_includes {
+        clang::detect_include_paths_for(preferred_clang)
+    } else {
+        (false, vec![])
+    };
     let mut binder = bindgen::Builder::default();
     binder = add_blocklists(binder);
     binder = add_allowlists(binder, pg_target_includes.iter().map(|x| x.as_str()));
@@ -807,10 +518,10 @@ fn run_bindgen(
     };
     let enum_names = Rc::new(RefCell::new(BTreeMap::new()));
     let overrides = BindingOverride::new_from(Rc::clone(&enum_names));
-    let out_path = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let temppath = tempfile::NamedTempFile::with_suffix(".c")?.into_temp_path();
     let bindings = binder
-        .header(include_h.display().to_string())
-        .clang_args(extra_bindgen_clang_args(pg_config)?)
+        .header_contents("pgrx.h", contents)
+        .clang_args(extra_bindgen_clang_args(target_os, pg_config)?)
         .clang_args(pg_target_includes.iter().map(|x| format!("-I{x}")))
         .detect_include_paths(autodetect)
         .parse_callbacks(Box::new(overrides))
@@ -826,8 +537,8 @@ fn run_bindgen(
         .formatter(bindgen::Formatter::None)
         .layout_tests(false)
         .default_non_copy_union_style(NonCopyUnionStyle::ManuallyDrop)
-        .wrap_static_fns(enable_cshim)
-        .wrap_static_fns_path(out_path.join("pgrx-cshim-static"))
+        .wrap_static_fns(true)
+        .wrap_static_fns_path(temppath.with_extension(""))
         .wrap_static_fns_suffix("__pgrx_cshim")
         .generate()
         .wrap_err_with(|| format!("Unable to generate bindings for pg{major_version}"))?;
@@ -856,8 +567,34 @@ pub const {module}_{variant}: {ty} = {value};"#,
             )
         })
     }));
+    binding_str.push_str(include_str!("../assets/cshim.rs"));
 
-    Ok(binding_str)
+    let bindgen_output =
+        syn::parse_file(&binding_str).wrap_err_with(|| "failed to parse generated bindings")?;
+
+    let oids = extract_oids(&bindgen_output);
+    let rewritten_items = rewrite_items(bindgen_output, &oids)
+        .wrap_err_with(|| format!("failed to rewrite items for pg{major_version}"))?;
+    let binding = {
+        let mut contents = quote! {
+            use crate as pg_sys;
+            use crate::{Datum, MultiXactId, Oid, PgNode, TransactionId};
+        };
+        contents.extend(rewritten_items);
+        contents
+    };
+    let binding_oids = format_builtin_oid_impl(oids);
+
+    let header = "/* Automatically generated by bindgen. Do not hand-edit. */";
+    let binding = format!("{header}\n{}", prettyplease::unparse(&syn::parse2(binding)?));
+    let binding_oids = format!("{header}\n{}", prettyplease::unparse(&syn::parse2(binding_oids)?));
+    let binding_cshim = format!(
+        "{header}\n{contents}\n{}\n{}",
+        std::fs::read_to_string(temppath)?,
+        include_str!("../assets/cshim.c")
+    );
+
+    Ok((binding, binding_oids, binding_cshim))
 }
 
 fn add_blocklists(bind: bindgen::Builder) -> bindgen::Builder {
@@ -924,55 +661,7 @@ fn add_derives(bind: bindgen::Builder) -> bindgen::Builder {
         .derive_partialord(false)
 }
 
-fn env_tracked(s: &str) -> Option<String> {
-    // a **sorted** list of environment variable keys that cargo might set that we don't need to track
-    // these were picked out, by hand, from: https://doc.rust-lang.org/cargo/reference/environment-variables.html
-    const CARGO_KEYS: &[&str] = &[
-        "BROWSER",
-        "DEBUG",
-        "DOCS_RS",
-        "HOST",
-        "HTTP_PROXY",
-        "HTTP_TIMEOUT",
-        "NUM_JOBS",
-        "OPT_LEVEL",
-        "OUT_DIR",
-        "PATH",
-        "PROFILE",
-        "TARGET",
-        "TERM",
-    ];
-
-    let is_cargo_key =
-        s.starts_with("CARGO") || s.starts_with("RUST") || CARGO_KEYS.binary_search(&s).is_ok();
-
-    if !is_cargo_key {
-        // if it's an envar that cargo gives us, we don't want to ask it to rerun build.rs if it changes
-        // we'll let cargo figure that out for itself, and doing so, depending on the key, seems to
-        // cause cargo to rerun build.rs every time, which is terrible
-        println!("cargo:rerun-if-env-changed={s}");
-    }
-    std::env::var(s).ok()
-}
-
-fn target_env_tracked(s: &str) -> Option<String> {
-    let target = env_tracked("TARGET").unwrap();
-    env_tracked(&format!("{s}_{target}")).or_else(|| env_tracked(s))
-}
-
-fn find_include(
-    pg_version: u16,
-    var: &str,
-    default: impl Fn() -> eyre::Result<PathBuf>,
-) -> eyre::Result<String> {
-    let value =
-        target_env_tracked(&format!("{var}_PG{pg_version}")).or_else(|| target_env_tracked(var));
-    let path = match value {
-        // No configured value: ask `pg_config`.
-        None => default()?,
-        // Configured to non-empty string: pass to bindgen
-        Some(overridden) => Path::new(&overridden).to_path_buf(),
-    };
+fn find_include(path: PathBuf) -> eyre::Result<String> {
     let path = std::fs::canonicalize(&path)
         .wrap_err(format!("cannot find {path:?} for C header files"))?
         .join("") // returning a `/`-ending path
@@ -985,30 +674,22 @@ fn find_include(
     }
 }
 
-fn pg_target_includes(pg_version: u16, pg_config: &PgConfig) -> eyre::Result<Vec<String>> {
-    let mut result =
-        vec![find_include(pg_version, "PGRX_INCLUDEDIR_SERVER", || pg_config.includedir_server())?];
-    if let Some("msvc") = env_tracked("CARGO_CFG_TARGET_ENV").as_deref() {
-        result.push(find_include(pg_version, "PGRX_PKGINCLUDEDIR", || pg_config.pkgincludedir())?);
-        result.push(find_include(pg_version, "PGRX_INCLUDEDIR_SERVER_PORT_WIN32", || {
-            pg_config.includedir_server_port_win32()
-        })?);
-        result.push(find_include(pg_version, "PGRX_INCLUDEDIR_SERVER_PORT_WIN32_MSVC", || {
-            pg_config.includedir_server_port_win32_msvc()
-        })?);
+fn pg_target_includes(target_env: &str, pg_config: &PgConfig) -> eyre::Result<Vec<String>> {
+    let mut result = vec![find_include(pg_config.includedir_server()?)?];
+    if target_env == "msvc" {
+        result.push(find_include(pg_config.pkgincludedir()?)?);
+        result.push(find_include(pg_config.includedir_server_port_win32()?)?);
+        result.push(find_include(pg_config.includedir_server_port_win32_msvc()?)?);
     }
     Ok(result)
 }
 
-fn build_shim(
-    shim_src: &path::Path,
-    shim_dst: &path::Path,
+pub fn build_cshim(
+    out_dir: impl AsRef<Path>,
+    target_os: &str,
+    target_env: &str,
     pg_config: &PgConfig,
 ) -> eyre::Result<()> {
-    let major_version = pg_config.major_version()?;
-
-    std::fs::copy(shim_src, shim_dst).unwrap();
-
     let mut build = cc::Build::new();
     let compiler = build.get_compiler();
     if compiler.is_like_gnu() || compiler.is_like_clang() {
@@ -1019,28 +700,29 @@ fn build_shim(
         build.flag("/Gy");
         build.flag("/Gw");
     }
-    for pg_target_include in pg_target_includes(major_version, pg_config)?.iter() {
+    for pg_target_include in pg_target_includes(target_env, pg_config)?.iter() {
         build.flag(format!("-I{pg_target_include}"));
     }
-    for flag in extra_bindgen_clang_args(pg_config)? {
+    for flag in extra_bindgen_clang_args(target_os, pg_config)? {
         build.flag(&flag);
     }
-    build.file(shim_dst);
+    build.file(out_dir.as_ref().join(format!("binding_cshim.c")));
+    build.opt_level(3);
     build.compile("pgrx-cshim");
     Ok(())
 }
 
-fn extra_bindgen_clang_args(pg_config: &PgConfig) -> eyre::Result<Vec<String>> {
+fn extra_bindgen_clang_args(target_os: &str, pg_config: &PgConfig) -> eyre::Result<Vec<String>> {
     let mut out = vec![];
     let flags = shlex::split(&pg_config.cppflags()?.to_string_lossy()).unwrap_or_default();
-    if env_tracked("CARGO_CFG_TARGET_OS").as_deref() != Some("windows") {
+    if target_os != "windows" {
         // Just give clang the full flag set, since presumably that's what we're
         // getting when we build the C shim anyway.
         // Skip it on Windows, since clang is used to generate cshim but MSVC is
         // used to compile PostgreSQL.
         out.extend(flags.iter().cloned());
     }
-    if env_tracked("CARGO_CFG_TARGET_OS").as_deref() == Some("macos") {
+    if target_os != "macos" {
         // Find the `-isysroot` flags so we can warn about them, so something
         // reasonable shows up if/when the build fails.
         //
@@ -1120,47 +802,6 @@ fn extra_bindgen_clang_args(pg_config: &PgConfig) -> eyre::Result<Vec<String>> {
     Ok(out)
 }
 
-fn run_command(mut command: &mut Command, version: &str) -> eyre::Result<Output> {
-    let mut dbg = String::new();
-
-    command = command
-        .env_remove("DEBUG")
-        .env_remove("MAKEFLAGS")
-        .env_remove("MAKELEVEL")
-        .env_remove("MFLAGS")
-        .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
-        .env_remove("OPT_LEVEL")
-        .env_remove("PROFILE")
-        .env_remove("OUT_DIR")
-        .env_remove("NUM_JOBS");
-
-    eprintln!("[{version}] {command:?}");
-    dbg.push_str(&format!("[{version}] -------- {command:?} -------- \n"));
-
-    let output = command.output()?;
-    let rc = output.clone();
-
-    if !output.stdout.is_empty() {
-        for line in String::from_utf8(output.stdout).unwrap().lines() {
-            if line.starts_with("cargo:") {
-                dbg.push_str(&format!("{line}\n"));
-            } else {
-                dbg.push_str(&format!("[{version}] [stdout] {line}\n"));
-            }
-        }
-    }
-
-    if !output.stderr.is_empty() {
-        for line in String::from_utf8(output.stderr).unwrap().lines() {
-            dbg.push_str(&format!("[{version}] [stderr] {line}\n"));
-        }
-    }
-    dbg.push_str(&format!("[{version}] /----------------------------------------\n"));
-
-    eprintln!("{dbg}");
-    Ok(rc)
-}
-
 fn apply_pg_guard(items: &Vec<syn::Item>) -> eyre::Result<proc_macro2::TokenStream> {
     let mut out = proc_macro2::TokenStream::new();
     for item in items {
@@ -1180,6 +821,41 @@ fn apply_pg_guard(items: &Vec<syn::Item>) -> eyre::Result<proc_macro2::TokenStre
     Ok(out)
 }
 
+fn fix_linkage(file: &mut syn::File) {
+    use syn::visit_mut::VisitMut;
+    use syn::{Expr, ExprLit, Lit};
+    pub struct Visitor {}
+    impl VisitMut for Visitor {
+        fn visit_foreign_item_fn_mut(&mut self, func: &mut syn::ForeignItemFn) {
+            let link_with_cshim = func.attrs.iter().any(|attr| match &attr.meta {
+                syn::Meta::NameValue(kv) if kv.path.is_ident("link_name") => {
+                    if let Expr::Lit(ExprLit { lit: Lit::Str(value), .. }) = &kv.value {
+                        value.value().ends_with("__pgrx_cshim")
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            });
+            if link_with_cshim {
+                func.attrs.insert(0, syn::parse_quote! { #[cfg(feature = "cshim")] });
+            } else {
+                func.attrs.insert(
+                    0,
+                    syn::parse_quote! { #[cfg_attr(target_os = "windows", link(name = "postgres"))] },
+                );
+            }
+        }
+        fn visit_foreign_item_static_mut(&mut self, variable: &mut syn::ForeignItemStatic) {
+            variable.attrs.insert(
+                0,
+                syn::parse_quote! { #[cfg_attr(target_os = "windows", link(name = "postgres"))] },
+            );
+        }
+    }
+    Visitor {}.visit_file_mut(file);
+}
+
 fn rewrite_c_abi_to_c_unwind(file: &mut syn::File) {
     use proc_macro2::Span;
     use syn::visit_mut::VisitMut;
@@ -1197,40 +873,13 @@ fn rewrite_c_abi_to_c_unwind(file: &mut syn::File) {
     Visitor {}.visit_file_mut(file);
 }
 
-fn rust_fmt(path: &Path) -> eyre::Result<()> {
-    // We shouldn't hit this path in a case where we care about it, but... just
-    // in case we probably should respect RUSTFMT.
-    let rustfmt = env_tracked("RUSTFMT").unwrap_or_else(|| "rustfmt".into());
-    let mut command = Command::new(rustfmt);
-    command.arg(path).args(["--edition", "2021"]).current_dir(".");
-
-    let out = run_command(&mut command, "[bindings_diff]");
-    match out {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => {
-            let rustfmt_output = format!(
-                r#"Problems running rustfmt: {command:?}:
-                {}
-                {}"#,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-
-            for line in rustfmt_output.lines() {
-                println!("cargo:warning={}", line);
-            }
-
-            // we won't fail the build because rustfmt failed
-            Ok(())
-        }
-        Err(e)
-            if e.downcast_ref::<std::io::Error>()
-                .ok_or(eyre!("Couldn't downcast error ref"))?
-                .kind()
-                == std::io::ErrorKind::NotFound =>
-        {
-            Err(e).wrap_err("Failed to run `rustfmt`, is it installed?")
-        }
-        Err(e) => Err(e),
-    }
+pub fn unzip(path: impl AsRef<Path>) -> eyre::Result<(String, String, String)> {
+    let mut ar = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let mut binding = String::new();
+    ar.by_name("binding.rs")?.read_to_string(&mut binding)?;
+    let mut binding_oids = String::new();
+    ar.by_name("binding_oids.rs")?.read_to_string(&mut binding_oids)?;
+    let mut binding_cshim = String::new();
+    ar.by_name("binding_cshim.c")?.read_to_string(&mut binding_cshim)?;
+    Ok((binding, binding_oids, binding_cshim))
 }

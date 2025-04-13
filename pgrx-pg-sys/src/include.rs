@@ -5,7 +5,7 @@
 #[cfg(all(feature = "pg13", not(docsrs)))]
 pub(crate) mod pg13 {
     #![allow(clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/pg13.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding.rs"));
 }
 #[cfg(all(feature = "pg13", docsrs))]
 pub(crate) mod pg13;
@@ -13,7 +13,7 @@ pub(crate) mod pg13;
 #[cfg(all(feature = "pg14", not(docsrs)))]
 pub(crate) mod pg14 {
     #![allow(clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/pg14.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding.rs"));
 }
 #[cfg(all(feature = "pg14", docsrs))]
 pub(crate) mod pg14;
@@ -21,7 +21,7 @@ pub(crate) mod pg14;
 #[cfg(all(feature = "pg15", not(docsrs)))]
 pub(crate) mod pg15 {
     #![allow(clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/pg15.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding.rs"));
 }
 #[cfg(all(feature = "pg15", docsrs))]
 pub(crate) mod pg15;
@@ -29,7 +29,7 @@ pub(crate) mod pg15;
 #[cfg(all(feature = "pg16", not(docsrs)))]
 pub(crate) mod pg16 {
     #![allow(clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/pg16.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding.rs"));
 }
 #[cfg(all(feature = "pg16", docsrs))]
 pub(crate) mod pg16;
@@ -37,7 +37,7 @@ pub(crate) mod pg16;
 #[cfg(all(feature = "pg17", not(docsrs)))]
 pub(crate) mod pg17 {
     #![allow(clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/pg17.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding.rs"));
 }
 #[cfg(all(feature = "pg17", docsrs))]
 pub(crate) mod pg17;
@@ -57,34 +57,34 @@ pub use pg17::*;
 // feature gate each pg-specific oid module
 #[cfg(all(feature = "pg13", not(docsrs)))]
 mod pg13_oids {
-    include!(concat!(env!("OUT_DIR"), "/pg13_oids.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding_oids.rs"));
 }
 #[cfg(all(feature = "pg13", docsrs))]
 mod pg13_oids;
 
 #[cfg(all(feature = "pg14", not(docsrs)))]
 mod pg14_oids {
-    include!(concat!(env!("OUT_DIR"), "/pg14_oids.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding_oids.rs"));
 }
 #[cfg(all(feature = "pg14", docsrs))]
 mod pg14_oids;
 
 #[cfg(all(feature = "pg15", not(docsrs)))]
 mod pg15_oids {
-    include!(concat!(env!("OUT_DIR"), "/pg15_oids.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding_oids.rs"));
 }
 #[cfg(all(feature = "pg15", docsrs))]
 mod pg15_oids;
 
 #[cfg(all(feature = "pg16", not(docsrs)))]
 mod pg16_oids {
-    include!(concat!(env!("OUT_DIR"), "/pg16_oids.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding_oids.rs"));
 }
 #[cfg(all(feature = "pg16", docsrs))]
 mod pg16_oids;
 #[cfg(all(feature = "pg17", not(docsrs)))]
 mod pg17_oids {
-    include!(concat!(env!("OUT_DIR"), "/pg17_oids.rs"));
+    include!(concat!(env!("OUT_DIR"), "/binding_oids.rs"));
 }
 #[cfg(all(feature = "pg17", docsrs))]
 mod pg17_oids;

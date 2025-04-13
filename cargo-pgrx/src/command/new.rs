@@ -7,12 +7,12 @@
 //LICENSE All rights reserved.
 //LICENSE
 //LICENSE Use of this source code is governed by the MIT license that can be found in the LICENSE file.
+use crate::CommandExecute;
 use eyre::eyre;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
-
-use crate::CommandExecute;
 
 /// Create a new extension crate
 #[derive(clap::Args, Debug)]
@@ -51,35 +51,22 @@ pub(crate) fn create_crate_template(
     name: &str,
     is_bgworker: bool,
 ) -> eyre::Result<()> {
-    create_directory_structure(path.clone())?;
+    create_directory_structure(&path)?;
     create_control_file(path.clone(), name)?;
     create_cargo_toml(path.clone(), name)?;
-    create_dotcargo_config_toml(path.clone(), name)?;
     create_lib_rs(path.clone(), name, is_bgworker)?;
     create_git_ignore(path.clone(), name)?;
-    create_pgrx_embed_rs(path)?;
+    create_pgrx_embed_rs(path.clone())?;
+    create_build_rs(path)?;
 
     Ok(())
 }
 
-fn create_directory_structure(mut src_dir: PathBuf) -> Result<(), std::io::Error> {
-    src_dir.push("src");
-    std::fs::create_dir_all(&src_dir)?;
-
-    src_dir.push("bin");
-    std::fs::create_dir_all(&src_dir)?;
-    src_dir.pop();
-
-    src_dir.pop();
-
-    src_dir.push(".cargo");
-    std::fs::create_dir_all(&src_dir)?;
-    src_dir.pop();
-
-    src_dir.push("sql");
-    std::fs::create_dir_all(&src_dir)?;
-    src_dir.pop();
-
+fn create_directory_structure(path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+    std::fs::create_dir(path.as_ref())?;
+    std::fs::create_dir(path.as_ref().join("src"))?;
+    std::fs::create_dir(path.as_ref().join("src").join("bin"))?;
+    std::fs::create_dir(path.as_ref().join("sql"))?;
     Ok(())
 }
 
@@ -97,16 +84,6 @@ fn create_cargo_toml(mut filename: PathBuf, name: &str) -> Result<(), std::io::E
     let mut file = std::fs::File::create(filename)?;
 
     file.write_all(format!(include_str!("../templates/cargo_toml"), name = name).as_bytes())?;
-
-    Ok(())
-}
-
-fn create_dotcargo_config_toml(mut filename: PathBuf, _name: &str) -> Result<(), std::io::Error> {
-    filename.push(".cargo");
-    filename.push("config.toml");
-    let mut file = std::fs::File::create(filename)?;
-
-    file.write_all(include_bytes!("../templates/cargo_config_toml"))?;
 
     Ok(())
 }
@@ -146,5 +123,12 @@ fn create_pgrx_embed_rs(mut filename: PathBuf) -> Result<(), std::io::Error> {
     filename.push("pgrx_embed.rs");
     let mut file = std::fs::File::create(filename)?;
     file.write_all(include_bytes!("../templates/pgrx_embed_rs"))?;
+    Ok(())
+}
+
+fn create_build_rs(mut filename: PathBuf) -> Result<(), std::io::Error> {
+    filename.push("build.rs");
+    let mut file = std::fs::File::create(filename)?;
+    file.write_all(include_bytes!("../templates/build_rs"))?;
     Ok(())
 }

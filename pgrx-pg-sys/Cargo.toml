@@ -19,8 +19,9 @@ repository = "https://github.com/pgcentralfoundation/pgrx/"
 documentation = "https://docs.rs/pgrx-pg-sys"
 readme = "README.md"
 edition = "2021"
-include = ["src/**/*", "README.md", "include/*", "pgrx-cshim.c", "bindgen.rs"]
+include = ["src/**", "assets/**", "README.md", "bindgen.rs"]
 build = "bindgen.rs"
+links = "postgres"
 
 [features]
 default = []
@@ -54,7 +55,9 @@ sptr = "0.3"
 cee-scape = "0.2"
 
 [build-dependencies]
+eyre.workspace = true
 pgrx-bindgen.workspace = true
+pgrx-pg-config.workspace = true
 
 [lints]
 # we allow improper_ctypes just to eliminate these warnings:

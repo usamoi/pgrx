@@ -1,4 +1,3 @@
-use super::target_env_tracked;
 use bindgen::ClangVersion;
 use clang_sys::support::Clang as ClangSys;
 use std::{ffi::OsStr, path::PathBuf};
@@ -16,10 +15,6 @@ use walkdir::{DirEntry, WalkDir};
 pub(crate) fn detect_include_paths_for(
     preferred_clang: Option<&std::path::Path>,
 ) -> (bool, Vec<PathBuf>) {
-    if target_env_tracked("PGRX_BINDGEN_NO_DETECT_INCLUDES").is_some() {
-        return (false, vec![]);
-    }
-
     // By asking bindgen for the version, we force it to pull an appropriate libclang,
     // allowing users to override it however they would usually override bindgen.
     let clang_major = match bindgen::clang_version() {
