@@ -3,7 +3,7 @@ name: Run PGRX tests
 on:
   push:
     branches:
-      - develop
+      - add-build-script
   pull_request:
     branches:
       - develop
@@ -96,7 +96,6 @@ jobs:
 
   pgrx_tests:
     name: Linux tests & examples
-    needs: lintck
     runs-on: ubuntu-22.04
     if: "!contains(github.event.head_commit.message, 'nogha')"
     env:
@@ -479,7 +478,6 @@ jobs:
 
   build_mac:
     name: MacOS build & test
-    needs: lintck
     runs-on: ${{ matrix.os }}
     if: "!contains(github.event.head_commit.message, 'nogha')"
     env:
@@ -582,7 +580,6 @@ jobs:
 
   build_windows:
     name: Windows build & test
-    needs: lintck
     runs-on: ${{ matrix.os }}
     if: "!contains(github.event.head_commit.message, 'nogha')"
     env:
